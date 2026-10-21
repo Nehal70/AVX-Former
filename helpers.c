@@ -1,5 +1,9 @@
+#ifndef HELPERS_C
+#define HELPERS_C
+
 #include <stdalign.h>
 #include <stdio.h> // Standard C Library
+#include <malloc.h>
 #include <immintrin.h> // Provides access to compiler intrinsics and vector types for x86 SIMD SSE, AVX, AVX2
 
 // Let's declare 2 Vectors for all ops
@@ -49,12 +53,16 @@ void add_2_arrays(float* v1, float* v2, int len1, int len2, float* addr) {
     // Have a default 0
     __m256 idx1 = _mm256_setzero_ps();
     __m256 idx2 = _mm256_setzero_ps();
+    int len = len1 < len2 ? len1 : len2;
     // Loop through
-    while (elems <= len1 && elems <= len2) {
-        // Atleast v1 or v2 has some elements left
-        if (elems < len1) { idx1 = ld_simd_reg(v1 + elems, (len1 - elems) % 8); } else { idx1 = _mm256_setzero_ps(); }  
-        if (elems < len2) { idx2 = ld_simd_reg(v2 + elems, (len2 - elems) % 8); } else { idx2 = _mm256_setzero_ps(); }
-        int max = (len1 - elems) % 8 > (len2 - elems) % 8 ? (len1 - elems) % 8 : (len2 - elems) % 8;
+    while (elems < len) {
+        //atleast v1 or v2 has some elements left
+        int left1 = len1 - elems;
+        int left2 = len2 - elems;
+        if (elems < len1) { idx1 = ld_simd_reg(v1 + elems, left1); } else { idx1 = _mm256_setzero_ps(); }
+        if (elems < len2) { idx2 = ld_simd_reg(v2 + elems, left2); } else { idx2 = _mm256_setzero_ps(); }
+        int max = left1 < left2 ? left1 : left2;
+        if (max > 8) max = 8;
         add_basic_2(idx1, idx2, addr + elems, max);
         // update elems
         elems += 8;
@@ -62,11 +70,18 @@ void add_2_arrays(float* v1, float* v2, int len1, int len2, float* addr) {
 }
 
 // Multiply 2 Vectors
-void fmadd_basic_2(__m256 v1, __m256 v2, __m256 currmax, float* addr, int max) {
+__m256 fmadd_basic_2(__m256 v1, __m256 v2, __m256 currmax, float* addr, int max) {
     __m256i indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     __m256i count_vec = _mm256_set1_epi32(max);
     __m256i mask = _mm256_cmpgt_epi32(count_vec, indices);
+    (void)addr; (void)mask;
     currmax = _mm256_fmadd_ps(v1, v2, currmax);
+    return currmax;
+}
+
+// return 32-byte aligned address 
+static void *alloc32(size_t bytes) {
+    return _aligned_malloc(bytes, 32);
 }
 
 // Horizontal Sum
@@ -96,13 +111,17 @@ void dot_product(float* v1, float* v2, float* dest, int len1, int len2, int dlen
     __m256 idx1 = _mm256_setzero_ps();
     __m256 idx2 = _mm256_setzero_ps();
     __m256 cmax = _mm256_setzero_ps();
+    (void)dlen;
     // Loop through
-    while (elems <= len1 && elems <= len2) {
+    while (elems < len1 && elems < len2) {
         // Atleast v1 or v2 has some elements left
-        if (elems < len1) { idx1 = ld_simd_reg(v1 + elems, (len1 - elems) % 8); } else { idx1 = _mm256_setzero_ps(); }  
-        if (elems < len2) { idx2 = ld_simd_reg(v2 + elems, (len2 - elems) % 8); } else { idx2 = _mm256_setzero_ps(); }
-        int max = (len1 - elems) % 8 > (len2 - elems) % 8 ? (len1 - elems) % 8 : (len2 - elems) % 8;
-        fmadd_basic_2(idx1, idx2, cmax, dest + elems, max);
+        int left1 = len1 - elems;
+        int left2 = len2 - elems;
+        if (elems < len1) { idx1 = ld_simd_reg(v1 + elems, left1); } else { idx1 = _mm256_setzero_ps(); }
+        if (elems < len2) { idx2 = ld_simd_reg(v2 + elems, left2); } else { idx2 = _mm256_setzero_ps(); }
+        int max = left1 < left2 ? left1 : left2;
+        if (max > 8) max = 8;
+        cmax = fmadd_basic_2(idx1, idx2, cmax, dest + elems, max);
         // update elems
         elems += 8;
     }
@@ -117,13 +136,15 @@ void sdot_product(float scalar, float* vector, int vlen, float* dest) {
     // Counter for how many done in vector
     int elems = 0;
     // Now we need to read 'vector' 
-    while (vlen > 0) {
+    while (elems < vlen) {
         // Get vector stored in simd reg
-        __m256 vec = ld_simd_reg(vector + elems, vlen - elems);
+        int left = vlen - elems;
+        __m256 vec = ld_simd_reg(vector + elems, left);
         // Multiply this with 'scaled'
-
+        __m256 out = _mm256_mul_ps(vec, scaled);
+        store_simd_reg(dest + elems, out, left);
+        elems += 8;
     }
-
 }
 
 void matmul (float* m1, float* m2, int row1, int col1, int row2, int col2, float* dest) {
@@ -176,6 +197,8 @@ void transpose_matmul (float* m1, float* m2, int row1, int col1, int row2, int c
 
     // Constraints, assume B's row_size is a multiple of 32
 
+    (void)col1;
+
     // Loop through each output row, then each tile
     for (int row = 0; row < row1; row++) {
         for (int krow = 0; krow < row2; krow++) {
@@ -218,45 +241,212 @@ void transpose_matmul (float* m1, float* m2, int row1, int col1, int row2, int c
     }
 }
 
-void exp (float* in) {
-    // Loop through, potentially loop '4' SIMD Reg at once. 
+//one register: e^x = 2^n * e^r
+static inline __m256 exp_ps(__m256 x) {
+    __m256 log2e = _mm256_set1_ps(1.4426950408889634f);
+    __m256 ln2 = _mm256_set1_ps(0.6931471805599453f);
+    //c0 + r*(c1 + r*(c2 + r*(c3 + r*(c4 + r*c5))))
+    __m256 c0 = _mm256_set1_ps(1.0f);
+    __m256 c1 = _mm256_set1_ps(1.0f);
+    __m256 c2 = _mm256_set1_ps(0.5f);
+    __m256 c3 = _mm256_set1_ps(0.1666666716f);
+    __m256 c4 = _mm256_set1_ps(0.04166666791f);
+    __m256 c5 = _mm256_set1_ps(0.00833333377f);
 
-    // Multiply Each SIMD Reg by a SIMD Reg that has log2e broadcasted | Eg. 3.2 --> 4.61
-    // Create 2 SIMD reg per SIMD reg --> Whole Number, Remainder | Eg. 4.61 --> 5
-    // For Remainder | Eg. 3.2 - (5*Ln2) = -0.2657
-    // Thus e^3.2 = 2^5*e^-0.2657
-    // Evaluate e^-0.2657 --> 0.7666 using fmadds
-    // FMADDS: Essentially, make it a polynomial and factor into c + r*(c1+r(c2+r)) and so on until 5. 
-    // Because each nesting level matches the exact form $A \cdot B + C$, every single step maps directly to
-    // one _mm256_fmadd_ps(prev_accumulator, r, next_coefficient)
+    //clamp so 2^n stays in float range
+    x = _mm256_min_ps(x, _mm256_set1_ps(88.0f));
+    x = _mm256_max_ps(x, _mm256_set1_ps(-88.0f));
 
+    //multiply by log2e | eg. 3.2 --> 4.61
+    __m256 n = _mm256_mul_ps(x, log2e);
+    n = _mm256_round_ps(n, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    //remainder | eg. 3.2 - (5*ln2) = -0.2657
+    __m256 r = _mm256_fnmadd_ps(n, ln2, x);
+
+    //evaluate e^r with nested fmadds
+    __m256 p = c5;
+    p = _mm256_fmadd_ps(p, r, c4);
+    p = _mm256_fmadd_ps(p, r, c3);
+    p = _mm256_fmadd_ps(p, r, c2);
+    p = _mm256_fmadd_ps(p, r, c1);
+    p = _mm256_fmadd_ps(p, r, c0);
+
+    //2^n in the exponent bits
+    __m256i ni = _mm256_cvtps_epi32(n);
+    __m256i pow2n = _mm256_slli_epi32(_mm256_add_epi32(ni, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(pow2n));
 }
 
-void mean (float* in, float* out) {
-    // Loop through, potentially with 4 SIMD reg
-    // Once you get all 4's sum, do reduction on the 4 ACCs into 1
-    // Do horizontal reduction into 1 number. 
-    // Broadcast this into a SIMD vector. Then, loop through all 4 SIMD vectors from beginning again and divide them
-    // Do this for all rows. 
+void exp_vec (float* in, int n) {
+    //loop through, potentially loop '4' simd reg at once.
+    int elems = 0;
+    while (elems < n) {
+        if (n - elems >= 32) {
+            __m256 x1 = _mm256_load_ps(in + elems);
+            __m256 x2 = _mm256_load_ps(in + elems + 8);
+            __m256 x3 = _mm256_load_ps(in + elems + 16);
+            __m256 x4 = _mm256_load_ps(in + elems + 24);
+            _mm256_store_ps(in + elems, exp_ps(x1));
+            _mm256_store_ps(in + elems + 8, exp_ps(x2));
+            _mm256_store_ps(in + elems + 16, exp_ps(x3));
+            _mm256_store_ps(in + elems + 24, exp_ps(x4));
+            elems += 32;
+        } else {
+            int left = n - elems;
+            __m256 x = ld_simd_reg(in + elems, left);
+            store_simd_reg(in + elems, exp_ps(x), left);
+            elems += 8;
+        }
+    }
 }
 
-void SingleHeadAttention(float* X, float* Wk, float* Wq, float* Wv, int dk, int t, float* O) {
-
-    // Get K, Q, V
-    float* K = (float*) aligned_alloc(32, t*dk*4); matmul(X, Wk, t, dk, dk, dk, K);
-    float* Q = (float*) aligned_alloc(32, t*dk*4); matmul(X, Wq, t, dk, dk, dk, Q);
-    float* V = (float*) aligned_alloc(32, t*dk*4); matmul(X, Wv, t, dk, dk, dk, V);
-
-    // Get S
-    float* S = (float*) aligned_alloc(32, t*t*4); transpose_matmul(Q, K, t, dk, t, dk, S);
-
-    // Get P
-    exp(S); 
-    float* P = (float*) aligned_alloc(32, t*t*4); mean(S, P);
-
-    // Get output
-    matmul(P, V, t, t, t, dk, O);
+void mean (float* in, float* out, int rows, int cols) {
+    //loop through, potentially with 4 simd reg
+    for (int r = 0; r < rows; r++) {
+        float* row = in + r * cols;
+        float* dest = out + r * cols;
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+        __m256 acc4 = _mm256_setzero_ps();
+        int elems = 0;
+        while (elems + 32 <= cols) {
+            acc1 = _mm256_add_ps(acc1, _mm256_load_ps(row + elems));
+            acc2 = _mm256_add_ps(acc2, _mm256_load_ps(row + elems + 8));
+            acc3 = _mm256_add_ps(acc3, _mm256_load_ps(row + elems + 16));
+            acc4 = _mm256_add_ps(acc4, _mm256_load_ps(row + elems + 24));
+            elems += 32;
+        }
+        while (elems < cols) {
+            acc1 = _mm256_add_ps(acc1, ld_simd_reg(row + elems, cols - elems));
+            elems += 8;
+        }
+        //once you get all 4's sum, do reduction on the 4 accs into 1
+        acc1 = _mm256_add_ps(acc1, acc2);
+        acc3 = _mm256_add_ps(acc3, acc4);
+        acc1 = _mm256_add_ps(acc1, acc3);
+        //do horizontal reduction into 1 number.
+        __m256 sum = hsum256_ps(acc1);
+        sum = _mm256_max_ps(sum, _mm256_set1_ps(1e-12f));
+        //broadcast this into a simd vector. then divide
+        elems = 0;
+        while (elems < cols) {
+            int left = cols - elems;
+            __m256 v = ld_simd_reg(row + elems, left);
+            store_simd_reg(dest + elems, _mm256_div_ps(v, sum), left);
+            elems += 8;
+        }
+    }
 }
 
+float row_mean(float* row, int n) {
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps();
+    int elems = 0;
+    while (elems + 32 <= n) {
+        acc1 = _mm256_add_ps(acc1, _mm256_load_ps(row + elems));
+        acc2 = _mm256_add_ps(acc2, _mm256_load_ps(row + elems + 8));
+        acc3 = _mm256_add_ps(acc3, _mm256_load_ps(row + elems + 16));
+        acc4 = _mm256_add_ps(acc4, _mm256_load_ps(row + elems + 24));
+        elems += 32;
+    }
+    while (elems < n) {
+        acc1 = _mm256_add_ps(acc1, ld_simd_reg(row + elems, n - elems));
+        elems += 8;
+    }
+    acc1 = _mm256_add_ps(acc1, acc2);
+    acc3 = _mm256_add_ps(acc3, acc4);
+    acc1 = _mm256_add_ps(acc1, acc3);
+    __m256 sum = hsum256_ps(acc1);
+    float tmp[8];
+    _mm256_storeu_ps(tmp, sum);
+    return tmp[0] / (float)n;
+}
+
+void sub_broadcast(float* row, int n, float mu, float* dest) {
+    __m256 m = _mm256_set1_ps(mu);
+    int elems = 0;
+    while (elems < n) {
+        int left = n - elems;
+        __m256 v = ld_simd_reg(row + elems, left);
+        store_simd_reg(dest + elems, _mm256_sub_ps(v, m), left);
+        elems += 8;
+    }
+}
+
+void square(float* in, int n, float* dest) {
+    int elems = 0;
+    while (elems < n) {
+        int left = n - elems;
+        __m256 v = ld_simd_reg(in + elems, left);
+        store_simd_reg(dest + elems, _mm256_mul_ps(v, v), left);
+        elems += 8;
+    }
+}
+
+float inv_sqrt(float x) {
+    __m256 v = _mm256_set1_ps(x);
+    __m256 y = _mm256_rsqrt_ps(v);
+    //one newton step: y * (1.5 - 0.5 * x * y * y)
+    __m256 halfx = _mm256_mul_ps(v, _mm256_set1_ps(0.5f));
+    __m256 threehalf = _mm256_set1_ps(1.5f);
+    y = _mm256_mul_ps(y, _mm256_fnmadd_ps(halfx, _mm256_mul_ps(y, y), threehalf));
+    float tmp[8];
+    _mm256_storeu_ps(tmp, y);
+    return tmp[0];
+}
+
+void scale_mul_add(float* centered, int n, float inv_std, float* gamma, float* beta, float* dest) {
+    __m256 s = _mm256_set1_ps(inv_std);
+    int elems = 0;
+    while (elems < n) {
+        int left = n - elems;
+        __m256 c = ld_simd_reg(centered + elems, left);
+        __m256 g = ld_simd_reg(gamma + elems, left);
+        __m256 b = ld_simd_reg(beta + elems, left);
+        __m256 y = _mm256_mul_ps(c, s);
+        y = _mm256_fmadd_ps(y, g, b);
+        store_simd_reg(dest + elems, y, left);
+        elems += 8;
+    }
+}
+
+void relu(float* x, int n) {
+    __m256 z = _mm256_setzero_ps();
+    int elems = 0;
+    while (elems < n) {
+        int left = n - elems;
+        __m256 v = ld_simd_reg(x + elems, left);
+        store_simd_reg(x + elems, _mm256_max_ps(v, z), left);
+        elems += 8;
+    }
+}
+
+void add_bias(float* mat, float* bias, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        add_2_arrays(mat + r * cols, bias, cols, cols, mat + r * cols);
+    }
+}
+
+void softmax(float* in, int rows, int cols, float* dest) {
+    for (int r = 0; r < rows; r++) {
+        float* row = in + r * cols;
+        float* out = dest + r * cols;
+        //row max so exp doesnt blow up
+        float mx = row[0];
+        int i = 1;
+        while (i < cols) {
+            if (row[i] > mx) mx = row[i];
+            i++;
+        }
+        sub_broadcast(row, cols, mx, out);
+        exp_vec(out, cols);
+    }
+    mean(dest, dest, rows, cols);
+}
+
+#endif
 
 // Compare 2 Vectors (Bitwise Grfeater Than)
