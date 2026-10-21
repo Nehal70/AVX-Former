@@ -8,7 +8,7 @@ this is windows / msvc. i compile it with:
 
 transformer.c includes the other .c files so you only need that one command. then run transformer.exe.
 
-files (messy but whatever):
+files:
 - helpers.c — avx2 kernels (matmul, softmax, etc)
 - pretransformer.c — token lookup + positional add
 - multiHeadAttention.c
